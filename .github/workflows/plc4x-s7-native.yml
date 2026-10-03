@@ -1,0 +1,147 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PLC4X S7 BOOL array native validation
+
+on:
+  push:
+    branches:
+      - ci/s7-bool-array-2742
+    paths:
+      - plc4j/drivers/s7/src/main/java/org/apache/plc4x/java/s7/S7CotpConnection.java
+      - plc4j/drivers/s7/src/test/java/org/apache/plc4x/java/s7/S7BoolArrayDecodeTest.java
+      - .github/workflows/plc4x-s7-native.yml
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Exact full commit SHA containing the reviewed fix and regression test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  s7-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BASE_SHA: 50249f5b15791e62e571eaab95ca8a744045acc8
+      REVIEWED_SHA: ${{ inputs.reviewed_sha || github.sha }}
+      DEVELOCITY_ACCESS_KEY: ''
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out exact reviewed commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.reviewed_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit identity and bounded diff
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          mkdir -p native-ci-reports
+          git diff --name-only "$BASE_SHA" HEAD | tee native-ci-reports/changed-files.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          changed = set(Path('native-ci-reports/changed-files.txt').read_text().splitlines())
+          required = {
+              'plc4j/drivers/s7/src/main/java/org/apache/plc4x/java/s7/S7CotpConnection.java',
+              'plc4j/drivers/s7/src/test/java/org/apache/plc4x/java/s7/S7BoolArrayDecodeTest.java',
+          }
+          allowed = required | {'.github/workflows/plc4x-s7-native.yml'}
+          assert required <= changed, f'Missing reviewed source/test changes: {required - changed}'
+          assert changed <= allowed, f'Unexpected changed files: {changed - allowed}'
+          PY
+          git diff "$BASE_SHA" HEAD > native-ci-reports/reviewed.diff
+          git show --no-patch --format=fuller HEAD > native-ci-reports/commit.txt
+
+      - name: Set up supported Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-package: jdk
+          java-version: '21'
+
+      - name: Install upstream Linux native prerequisite
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Record wrapper Maven and Java versions
+        run: |
+          set -euo pipefail
+          ./mvnw --version 2>&1 | tee native-ci-reports/toolchain.log
+          test -f .mvn/wrapper/maven-wrapper.properties
+          cat .mvn/wrapper/maven-wrapper.properties >> native-ci-reports/toolchain.log
+
+      - name: Build S7 reactor and run its default unit suite
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -am install 2>&1 | tee native-ci-reports/reactor.log
+          mkdir -p native-ci-reports/s7-full-suite
+          cp -a plc4j/drivers/s7/target/surefire-reports/. native-ci-reports/s7-full-suite/
+
+      - name: Run the focused regression against real PLC4X dependencies
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -Dtest=S7BoolArrayDecodeTest test 2>&1 | tee native-ci-reports/regression.log
+          mkdir -p native-ci-reports/s7-focused
+          cp -a plc4j/drivers/s7/target/surefire-reports/. native-ci-reports/s7-focused/
+
+      - name: Verify regression discovery and preserve a test-count summary
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee native-ci-reports/test-counts.txt
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          for stage in ['s7-full-suite', 's7-focused']:
+              reports = list(Path('native-ci-reports', stage).glob('TEST-*.xml'))
+              assert reports, f'No Surefire reports for {stage}'
+              regression = [p for p in reports if p.name == 'TEST-org.apache.plc4x.java.s7.S7BoolArrayDecodeTest.xml']
+              assert len(regression) == 1, f'Regression not discovered in {stage}'
+              suite = ET.parse(regression[0]).getroot()
+              assert int(suite.get('tests', '0')) > 0, f'No regression tests in {stage}'
+              for attr in ['failures', 'errors', 'skipped']:
+                  assert int(suite.get(attr, '0')) == 0, f'Regression {attr} in {stage}'
+              counts = {attr: 0 for attr in ['tests', 'failures', 'errors', 'skipped']}
+              for report in reports:
+                  root = ET.parse(report).getroot()
+                  for attr in counts:
+                      counts[attr] += int(root.get(attr, '0'))
+              assert counts['failures'] == counts['errors'] == 0, f'Failed tests in {stage}: {counts}'
+              print(stage, counts)
+          PY
+
+      - name: Preserve logs and every generated test report on success or failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plc4x-s7-native-${{ env.REVIEWED_SHA }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            native-ci-reports/**
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+            **/target/site/jacoco/**

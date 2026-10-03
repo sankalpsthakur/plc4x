@@ -980,6 +980,18 @@ public class S7CotpConnection extends ConnectionBase<S7Configuration> {
             return DataItem.staticParse(readBuffer, tag.getDataType().getDataProtocolId(),
                 driverContext.getControllerType(), stringLength);
         }
+        if (tag.getDataType() == TransportSize.BOOL) {
+            // Arrays are packed least-significant bit first, unlike scalar BOOLs,
+            // whose DataItem parser consumes a complete byte per value.
+            int numElements = tag.getNumberOfElements();
+            if (data.length < (numElements + 7L) / 8) {
+                throw new BufferException("Not enough data for BOOL array");
+            }
+            PlcValue[] resultItems = IntStream.range(0, numElements)
+                .mapToObj(i -> new PlcBOOL((data[i / 8] & (1 << (i % 8))) != 0))
+                .toArray(PlcValue[]::new);
+            return DefaultPlcValueHandler.of(tag, resultItems);
+        }
         if (tag.getDataType() == TransportSize.BYTE) {
             return new PlcRawByteArray(data);
         }
