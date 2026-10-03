@@ -56,14 +56,17 @@ jobs:
       - name: Check commit identity and bounded diff
         run: |
           set -euo pipefail
+          export REPORT_DIR="$RUNNER_TEMP/plc4x-s7-native-reports"
+          echo "REPORT_DIR=$REPORT_DIR" >> "$GITHUB_ENV"
           [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
           git merge-base --is-ancestor "$BASE_SHA" HEAD
-          mkdir -p native-ci-reports
-          git diff --name-only "$BASE_SHA" HEAD | tee native-ci-reports/changed-files.txt
+          mkdir -p "$REPORT_DIR"
+          git diff --name-only "$BASE_SHA" HEAD | tee "$REPORT_DIR/changed-files.txt"
           python3 - <<'PY'
           from pathlib import Path
-          changed = set(Path('native-ci-reports/changed-files.txt').read_text().splitlines())
+          import os
+          changed = set((Path(os.environ['REPORT_DIR']) / 'changed-files.txt').read_text().splitlines())
           required = {
               'plc4j/drivers/s7/src/main/java/org/apache/plc4x/java/s7/S7CotpConnection.java',
               'plc4j/drivers/s7/src/test/java/org/apache/plc4x/java/s7/S7BoolArrayDecodeTest.java',
@@ -72,8 +75,8 @@ jobs:
           assert required <= changed, f'Missing reviewed source/test changes: {required - changed}'
           assert changed <= allowed, f'Unexpected changed files: {changed - allowed}'
           PY
-          git diff "$BASE_SHA" HEAD > native-ci-reports/reviewed.diff
-          git show --no-patch --format=fuller HEAD > native-ci-reports/commit.txt
+          git diff "$BASE_SHA" HEAD > "$REPORT_DIR/reviewed.diff"
+          git show --no-patch --format=fuller HEAD > "$REPORT_DIR/commit.txt"
 
       - name: Set up supported Java 21
         uses: actions/setup-java@v6
@@ -91,32 +94,33 @@ jobs:
       - name: Record wrapper Maven and Java versions
         run: |
           set -euo pipefail
-          ./mvnw --version 2>&1 | tee native-ci-reports/toolchain.log
+          ./mvnw --version 2>&1 | tee "$REPORT_DIR/toolchain.log"
           test -f .mvn/wrapper/maven-wrapper.properties
-          cat .mvn/wrapper/maven-wrapper.properties >> native-ci-reports/toolchain.log
+          cat .mvn/wrapper/maven-wrapper.properties >> "$REPORT_DIR/toolchain.log"
 
       - name: Build S7 reactor and run its default unit suite
         run: |
           set -euo pipefail
-          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -am install 2>&1 | tee native-ci-reports/reactor.log
-          mkdir -p native-ci-reports/s7-full-suite
-          cp -a plc4j/drivers/s7/target/surefire-reports/. native-ci-reports/s7-full-suite/
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -am install 2>&1 | tee "$REPORT_DIR/reactor.log"
+          mkdir -p "$REPORT_DIR/s7-full-suite"
+          cp -a plc4j/drivers/s7/target/surefire-reports/. "$REPORT_DIR/s7-full-suite/"
 
       - name: Run the focused regression against real PLC4X dependencies
         run: |
           set -euo pipefail
-          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -Dtest=S7BoolArrayDecodeTest test 2>&1 | tee native-ci-reports/regression.log
-          mkdir -p native-ci-reports/s7-focused
-          cp -a plc4j/drivers/s7/target/surefire-reports/. native-ci-reports/s7-focused/
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -Dtest=S7BoolArrayDecodeTest test 2>&1 | tee "$REPORT_DIR/regression.log"
+          mkdir -p "$REPORT_DIR/s7-focused"
+          cp -a plc4j/drivers/s7/target/surefire-reports/. "$REPORT_DIR/s7-focused/"
 
       - name: Verify regression discovery and preserve a test-count summary
         run: |
           set -euo pipefail
-          python3 - <<'PY' | tee native-ci-reports/test-counts.txt
+          python3 - <<'PY' | tee "$REPORT_DIR/test-counts.txt"
           from pathlib import Path
+          import os
           import xml.etree.ElementTree as ET
           for stage in ['s7-full-suite', 's7-focused']:
-              reports = list(Path('native-ci-reports', stage).glob('TEST-*.xml'))
+              reports = list(Path(os.environ['REPORT_DIR'], stage).glob('TEST-*.xml'))
               assert reports, f'No Surefire reports for {stage}'
               regression = [p for p in reports if p.name == 'TEST-org.apache.plc4x.java.s7.S7BoolArrayDecodeTest.xml']
               assert len(regression) == 1, f'Regression not discovered in {stage}'
@@ -141,7 +145,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: |
-            native-ci-reports/**
+            ${{ runner.temp }}/plc4x-s7-native-reports/**
             **/target/surefire-reports/**
             **/target/failsafe-reports/**
             **/target/site/jacoco/**
