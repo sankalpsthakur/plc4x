@@ -1,0 +1,203 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PLC4X S7 BOOL array native before and after
+
+on:
+  push:
+    branches:
+      - ci/s7-bool-array-red-green-2742
+    paths:
+      - .github/workflows/plc4x-s7-red-green.yml
+
+permissions:
+  contents: read
+
+jobs:
+  s7-native-before-after:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BASE_SHA: 50249f5b15791e62e571eaab95ca8a744045acc8
+      CANDIDATE_SHA: 17f13d76f2273c693cc47288eead54b5f4314c2a
+      EVENT_SHA: ${{ github.sha }}
+      SOURCE_PATH: plc4j/drivers/s7/src/main/java/org/apache/plc4x/java/s7/S7CotpConnection.java
+      TEST_PATH: plc4j/drivers/s7/src/test/java/org/apache/plc4x/java/s7/S7BoolArrayDecodeTest.java
+      DEVELOCITY_ACCESS_KEY: ''
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out exact validation commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify original candidate bytes and workflow-only extension
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="$RUNNER_TEMP/plc4x-s7-before-after"
+          echo "REPORT_DIR=$REPORT_DIR" >> "$GITHUB_ENV"
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git diff --name-only "$CANDIDATE_SHA" HEAD)" = '.github/workflows/plc4x-s7-red-green.yml'
+          git diff --exit-code "$CANDIDATE_SHA" HEAD -- "$SOURCE_PATH" "$TEST_PATH"
+          mkdir -p "$REPORT_DIR"
+          git diff --name-only "$BASE_SHA" HEAD > "$REPORT_DIR/changed-files.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          changed = set(Path(os.environ['REPORT_DIR'], 'changed-files.txt').read_text().splitlines())
+          required = {os.environ['SOURCE_PATH'], os.environ['TEST_PATH']}
+          assert required <= changed, f'Missing source/test changes: {required - changed}'
+          allowed = required | {'.github/workflows/plc4x-s7-native.yml', '.github/workflows/plc4x-s7-red-green.yml'}
+          assert changed <= allowed, f'Unexpected changes: {changed - allowed}'
+          PY
+          git show --no-patch --format=fuller HEAD > "$REPORT_DIR/commit.txt"
+          git diff "$BASE_SHA" HEAD > "$REPORT_DIR/validation.diff"
+          git rev-parse "$BASE_SHA:$SOURCE_PATH" > "$REPORT_DIR/baseline-source-blob.txt"
+          git rev-parse "HEAD:$SOURCE_PATH" > "$REPORT_DIR/candidate-source-blob.txt"
+          git rev-parse "HEAD:$TEST_PATH" > "$REPORT_DIR/regression-test-blob.txt"
+
+      - name: Set up supported Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-package: jdk
+          java-version: '21'
+
+      - name: Install upstream Linux native prerequisite
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Record native toolchain
+        run: |
+          set -euo pipefail
+          ./mvnw --version 2>&1 | tee "$REPORT_DIR/toolchain.log"
+          cat .mvn/wrapper/maven-wrapper.properties >> "$REPORT_DIR/toolchain.log"
+
+      - name: Build candidate reactor and run default native suites
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -am install 2>&1 | tee "$REPORT_DIR/reactor.log"
+          mkdir -p "$REPORT_DIR/full-suite"
+          cp -a plc4j/drivers/s7/target/surefire-reports/. "$REPORT_DIR/full-suite/"
+          if test -d plc4j/drivers/s7/target/failsafe-reports; then
+            cp -a plc4j/drivers/s7/target/failsafe-reports "$REPORT_DIR/full-integration"
+          fi
+
+      - name: Run unchanged regression with original decoder and require native failure
+        run: |
+          set -euo pipefail
+          cp "$SOURCE_PATH" "$RUNNER_TEMP/plc4x-s7-candidate.java"
+          trap 'cp "$RUNNER_TEMP/plc4x-s7-candidate.java" "$SOURCE_PATH"' EXIT
+          git show "$BASE_SHA:$SOURCE_PATH" > "$SOURCE_PATH"
+          test "$(git hash-object "$SOURCE_PATH")" = "$(cat "$REPORT_DIR/baseline-source-blob.txt")"
+          test "$(git hash-object "$TEST_PATH")" = "$(cat "$REPORT_DIR/regression-test-blob.txt")"
+          set +e
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -Dtest=S7BoolArrayDecodeTest clean test 2>&1 | tee "$REPORT_DIR/before.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${statuses[1]}" -eq 0
+          test "${statuses[0]}" -ne 0
+          printf '%s\n' "${statuses[0]}" > "$REPORT_DIR/before-maven-exit.txt"
+          mkdir -p "$REPORT_DIR/before"
+          cp -a plc4j/drivers/s7/target/surefire-reports/. "$REPORT_DIR/before/"
+          cp "$RUNNER_TEMP/plc4x-s7-candidate.java" "$SOURCE_PATH"
+          git diff --exit-code HEAD -- "$SOURCE_PATH" "$TEST_PATH"
+
+      - name: Run same unchanged regression with candidate decoder and require native success
+        run: |
+          set -euo pipefail
+          test "$(git hash-object "$SOURCE_PATH")" = "$(cat "$REPORT_DIR/candidate-source-blob.txt")"
+          test "$(git hash-object "$TEST_PATH")" = "$(cat "$REPORT_DIR/regression-test-blob.txt")"
+          ./mvnw -B -ntp -Pwith-java -pl plc4j/drivers/s7 -Dtest=S7BoolArrayDecodeTest clean test 2>&1 | tee "$REPORT_DIR/after.log"
+          mkdir -p "$REPORT_DIR/after"
+          cp -a plc4j/drivers/s7/target/surefire-reports/. "$REPORT_DIR/after/"
+
+      - name: Require discovered cases and specific original failure modes
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee "$REPORT_DIR/test-counts.txt"
+          from pathlib import Path
+          import os
+          import xml.etree.ElementTree as ET
+          base = Path(os.environ['REPORT_DIR'])
+          filename = 'TEST-org.apache.plc4x.java.s7.S7BoolArrayDecodeTest.xml'
+          for stage in ['full-suite', 'before', 'after']:
+              reports = list((base / stage).glob('TEST-*.xml'))
+              assert reports, f'No fresh native XML for {stage}'
+              root = ET.parse(base / stage / filename).getroot()
+              assert int(root.get('tests', '0')) == 10, f'Incomplete regression in {stage}'
+              assert int(root.get('skipped', '0')) == 0, f'Skipped regression in {stage}'
+              cases = root.findall('testcase')
+              assert len(cases) == 10, f'Missing case records in {stage}'
+              totals = {key: 0 for key in ['tests', 'failures', 'errors', 'skipped']}
+              for report in reports:
+                  suite = ET.parse(report).getroot()
+                  for key in totals:
+                      totals[key] += int(suite.get(key, '0'))
+              if stage == 'before':
+                  assert len(reports) == 1, 'Unexpected or stale reports in focused baseline'
+                  packed = [case for case in cases if case.get('name', '').startswith('decodesPackedBitsAcrossByteBoundaries')]
+                  assert len(packed) == 7, 'Packed-bit parameterized cases missing'
+                  high = [case for case in cases if case.get('name') == 'ignoresUnusedHighBitsOfTheLastByte']
+                  scalar = [case for case in cases if case.get('name') == 'keepsScalarBoolDecoding']
+                  truncated = [case for case in cases if case.get('name') == 'rejectsTruncatedPackedArray']
+                  assert len(high) == len(scalar) == len(truncated) == 1, 'Named cases missing'
+                  for case in packed + high:
+                      error = case.find('error')
+                      assert error is not None, f'Expected original packed-array error: {case.get("name")}'
+                      detail = ET.tostring(error, encoding='unicode')
+                      assert 'NullPointerException' in detail and 'parsePlcValue' in detail, detail
+                  assert scalar[0].find('error') is None and scalar[0].find('failure') is None, 'Scalar baseline changed'
+                  failure = truncated[0].find('failure')
+                  assert failure is not None, 'Expected original truncation-contract failure'
+                  detail = ET.tostring(failure, encoding='unicode')
+                  assert 'AssertionFailedError' in detail and 'BufferException' in detail and 'NullPointerException' in detail, detail
+                  assert totals['errors'] == 8 and totals['failures'] == 1, totals
+              else:
+                  assert totals['failures'] == totals['errors'] == totals['skipped'] == 0, totals
+                  if stage == 'after':
+                      assert len(reports) == 1 and totals['tests'] == 10, 'Unexpected focused after reports'
+                  else:
+                      assert totals['tests'] > 10, 'Default native suite missing'
+              print(stage, totals)
+          integration = list((base / 'full-integration').glob('TEST-*.xml'))
+          for report in integration:
+              suite = ET.parse(report).getroot()
+              assert int(suite.get('tests', '0')) > 0, f'Empty integration report: {report}'
+              assert all(int(suite.get(key, '0')) == 0 for key in ['failures', 'errors', 'skipped']), report
+              print('synthetic-integration', report.name, suite.get('tests'))
+          PY
+
+      - name: Preserve native XML, logs and source identity on every outcome
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plc4x-s7-before-after-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/plc4x-s7-before-after/**
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+            **/target/site/jacoco/**
